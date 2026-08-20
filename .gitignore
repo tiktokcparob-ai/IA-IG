@@ -1,6 +1,6 @@
-.env
-__pycache__/
 *.pyc
-koda_*.json
+__pycache__/
+data/
+koda7.db
+.env
 *.log
-
