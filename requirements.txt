@@ -1,0 +1,8 @@
+pyTelegramBotAPI>=4.15.0
+groq>=0.4.0
+PyGithub>=2.1.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+rich>=13.7.0
+schedule>=1.2.0
+
