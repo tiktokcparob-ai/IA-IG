@@ -1,23 +1,69 @@
-name: AI Agent Workflow
+name: 🤖 KODA-7 AI Agent
+
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'وضع التشغيل'
+        required: true
+        default: 'agent'
+        type: choice
+        options:
+          - agent
+          - scheduler
+          - maintenance
+  schedule:
+    - cron: '0 */6 * * *'  # يعمل كل 6 ساعات تلقائيًا
 
 jobs:
-  run-agent:
+  koda-agent:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
+    timeout-minutes: 30
+    
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
       
-      - name: Set up Python
-        uses: actions/setup-python@v4
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
         with:
-          python-version: '3.10'
-          
-      - name: Install dependencies
-        run: pip install pyTelegramBotAPI groq PyGithub python-dotenv
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
+
+      - name: 🐍 Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 📦 Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyTelegramBotAPI groq PyGithub python-dotenv requests rich schedule
+
+      - name: 🔐 Setup Environment
+        run: |
+          echo "${{ secrets.ALL_SECRETS }}" > .env
+          echo "RUN_ID=${{ github.run_id }}" >> .env
+          echo "RUN_NUMBER=${{ github.run_number }}" >> .env
+          echo "REPO=${{ github.repository }}" >> .env
+
+      - name: 🤖 Run KODA-7 Agent
+        run: python agent.py --mode ${{ github.event.inputs.mode || 'agent' }}
+        env:
+          PYTHONUNBUFFERED: 1
+
+      - name: 💾 Commit Changes (if any)
+        run: |
+          git config --local user.email "koda7@bot.ai"
+          git config --local user.name "KODA-7 AI"
+          git add -A
+          git diff --quiet && git diff --staged --quiet || git commit -m "🤖 KODA-7 auto-update [run ${{ github.run_number }}]"
+          git push || echo "Nothing to push"
+
+      - name: 🧹 Cleanup
+        if: always()
+        run: rm -f .env
         
-      - name: Create .env from single secret
-        run: echo "${{ secrets.ALL_SECRETS }}" > .env
-        
-      - name: Run AI Agent
-        run: python agent.py
