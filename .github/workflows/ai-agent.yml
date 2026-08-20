@@ -1,4 +1,4 @@
-name: KODA-7 AI Agent
+name: KODA-7 ULTIMATE
 
 on:
   schedule:
@@ -6,38 +6,28 @@ on:
   workflow_dispatch:
 
 jobs:
-  run-agent:
+  run:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: write
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           token: ${{ secrets.GH_PAT }}
-
-      - name: Setup Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
-
-      - name: Install Dependencies
-        run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Run KODA-7
+      - run: pip install -r requirements.txt
+      - name: Run Agent
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GH_PAT: ${{ secrets.GH_PAT }}
         run: python agent.py
-
-      - name: Commit changes
+      - name: Commit auto changes
         if: success()
         run: |
           git config user.name "KODA-7"
