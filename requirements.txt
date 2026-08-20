@@ -2,6 +2,7 @@ telebot==0.0.5
 groq==0.4.0
 PyGithub==2.1.1
 instagrapi==2.0.0
+Pillow>=8.1.1
 rich==13.4.2
 requests==2.31.0
 python-dotenv==1.0.0
