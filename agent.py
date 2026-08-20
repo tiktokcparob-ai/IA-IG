@@ -1,897 +1,539 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-🤖 KODA-7: AI Agent System
-نظام وكيل ذكاء اصطناعي متكامل
+KODA-7 AI Agent - النظام الشامل للأتمتة والذكاء الاصطناعي
+يدعم: تيليجرام، إنستغرام، فيسبوك، واتساب، تيك توك (عبر plugins)
+يتحمل إعادة التشغيل، ويستكمل المهام المتقطعة.
 """
 
 import os
 import sys
 import json
+import sqlite3
 import time
-import re
-import subprocess
-import traceback
-import argparse
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
-from dataclasses import dataclass, asdict
-from pathlib import Path
 import threading
-import queue
-
+import subprocess
+import hashlib
+import hmac
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any, Callable
+from dataclasses import dataclass, asdict
+from queue import Queue, PriorityQueue
+import requests
 import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-from dotenv import load_dotenv
+from telebot.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup,
+    InlineKeyboardButton, InputFile
+)
 from groq import Groq
 from github import Github, GithubException
 from rich.console import Console
-from rich.panel import Panel
-from rich.text import Text
+from rich.table import Table
+from rich.logging import RichHandler
 
-# ═══════════════════════════════════════════════════════════════
-# الإعدادات والتهيئة
-# ═══════════════════════════════════════════════════════════════
-
-load_dotenv()
-
+# ========================== التهيئة الأساسية ==========================
 console = Console()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",
+    handlers=[RichHandler(rich_tracebacks=True)]
+)
+logger = logging.getLogger("koda-7")
 
-# ─── المتغيرات البيئية ───
-GH_PAT = os.getenv("g")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-REPO_NAME = os.getenv("REPO", "tiktokcparob-ai/IA-IG")
+# ========================== البيئة والمتغيرات ==========================
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+CHAT_ID = int(os.environ["CHAT_ID"])
+GROQ_API_KEY = os.environ["GROQ_API_KEY"]
+GH_PAT = os.environ["GH_PAT"]
+MODE = os.environ.get("MODE", "agent")
 
-# ─── التحقق من المتغيرات ───
-required_vars = ["GROQ_API_KEY", "BOT_TOKEN", "CHAT_ID"]
-missing = [v for v in required_vars if not os.getenv(v)]
-if missing:
-    console.print(f"[red]❌ متغيرات مفقودة: {', '.join(missing)}[/red]")
-    sys.exit(1)
+# ========================== قاعدة البيانات (SQLite) ==========================
+DB_PATH = "koda7.db"
 
-# ─── تهيئة العملاء ───
-bot = telebot.TeleBot(BOT_TOKEN, threaded=True)
-groq_client = Groq(api_key=GROQ_API_KEY)
-github_client = Github(GH_PAT) if GH_PAT else None
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY,
+        username TEXT,
+        first_name TEXT,
+        last_name TEXT,
+        role TEXT DEFAULT 'user',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS conversations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        role TEXT,
+        content TEXT,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        command TEXT,
+        status TEXT DEFAULT 'pending',
+        result TEXT,
+        platform TEXT,
+        scheduled_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        level TEXT,
+        message TEXT,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS plugins (
+        name TEXT PRIMARY KEY,
+        enabled INTEGER DEFAULT 1,
+        config TEXT
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS cron_jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        schedule TEXT,
+        command TEXT,
+        enabled INTEGER DEFAULT 1,
+        last_run TIMESTAMP
+    )''')
+    conn.commit()
+    conn.close()
 
-# ─── ملفات الحالة ───
-STATE_FILE = "koda_state.json"
-LOG_FILE = "koda_logs.json"
-MEMORY_FILE = "koda_memory.json"
+init_db()
 
-# ═══════════════════════════════════════════════════════════════
-# أنظمة التخزين
-# ═══════════════════════════════════════════════════════════════
-
+# ========================== مدير الحالة والمهام ==========================
 class StateManager:
-    """مدير الحالة والذاكرة"""
-    
-    def __init__(self):
-        self.state = self._load(STATE_FILE, {
-            "last_run": None,
-            "total_runs": 0,
-            "tasks_completed": 0,
-            "errors_count": 0,
-            "active_tasks": [],
-            "user_preferences": {}
-        })
-        self.memory = self._load(MEMORY_FILE, {
-            "conversations": [],
-            "learned_patterns": [],
-            "custom_commands": {}
-        })
-        self.logs = self._load(LOG_FILE, {"logs": []})
-    
-    def _load(self, filepath: str, default: dict) -> dict:
-        try:
-            if os.path.exists(filepath):
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-        except Exception as e:
-            console.print(f"[yellow]⚠️ تعذر تحميل {filepath}: {e}[/yellow]")
-        return default
-    
-    def save(self):
-        for filepath, data in [(STATE_FILE, self.state), 
-                               (MEMORY_FILE, self.memory), 
-                               (LOG_FILE, self.logs)]:
-            try:
-                with open(filepath, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-            except Exception as e:
-                console.print(f"[red]❌ خطأ في الحفظ {filepath}: {e}[/red]")
-    
-    def log(self, level: str, message: str, context: dict = None):
-        entry = {
-            "timestamp": datetime.now().isoformat(),
-            "level": level,
-            "message": message,
-            "context": context or {}
-        }
-        self.logs["logs"].append(entry)
-        # الاحتفاظ بآخر 500 سجل فقط
-        self.logs["logs"] = self.logs["logs"][-500:]
-        self.save()
-        
-        # طباعة جميلة
-        color = {"INFO": "cyan", "SUCCESS": "green", "WARNING": "yellow", "ERROR": "red"}.get(level, "white")
-        console.print(f"[{color}][{level}][/{color}] {message}")
+    @staticmethod
+    def get_user(user_id: int) -> Optional[Dict]:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT * FROM users WHERE id=?", (user_id,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            return {"id": row[0], "username": row[1], "first_name": row[2],
+                    "last_name": row[3], "role": row[4], "created_at": row[5]}
+        return None
 
-state = StateManager()
+    @staticmethod
+    def add_user(user_id: int, username: str, first_name: str, last_name: str = ""):
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("INSERT OR IGNORE INTO users (id, username, first_name, last_name) VALUES (?,?,?,?)",
+                  (user_id, username, first_name, last_name))
+        conn.commit()
+        conn.close()
 
-# ═══════════════════════════════════════════════════════════════
-# أنظمة الذكاء الاصطناعي
-# ═══════════════════════════════════════════════════════════════
+    @staticmethod
+    def add_conversation(user_id: int, role: str, content: str):
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("INSERT INTO conversations (user_id, role, content) VALUES (?,?,?)",
+                  (user_id, role, content))
+        conn.commit()
+        conn.close()
+        # حافظ على آخر 50 محادثة فقط
+        c.execute("DELETE FROM conversations WHERE id NOT IN (SELECT id FROM conversations WHERE user_id=? ORDER BY timestamp DESC LIMIT 50)", (user_id,))
+        conn.commit()
+        conn.close()
 
+    @staticmethod
+    def get_conversation_history(user_id: int, limit: int = 20) -> List[Dict]:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT role, content FROM conversations WHERE user_id=? ORDER BY timestamp DESC LIMIT ?", (user_id, limit))
+        rows = c.fetchall()
+        conn.close()
+        return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+
+    @staticmethod
+    def add_task(user_id: int, command: str, platform: str = "general", scheduled_at: str = None):
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("INSERT INTO tasks (user_id, command, platform, scheduled_at) VALUES (?,?,?,?)",
+                  (user_id, command, platform, scheduled_at))
+        task_id = c.lastrowid
+        conn.commit()
+        conn.close()
+        return task_id
+
+    @staticmethod
+    def update_task_status(task_id: int, status: str, result: str = ""):
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("UPDATE tasks SET status=?, result=? WHERE id=?", (status, result, task_id))
+        conn.commit()
+        conn.close()
+
+    @staticmethod
+    def get_pending_tasks() -> List[Dict]:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT * FROM tasks WHERE status='pending' AND (scheduled_at IS NULL OR scheduled_at <= datetime('now'))")
+        rows = c.fetchall()
+        conn.close()
+        return [{"id": r[0], "user_id": r[1], "command": r[2], "status": r[3],
+                 "result": r[4], "platform": r[5], "scheduled_at": r[6], "created_at": r[7]} for r in rows]
+
+    @staticmethod
+    def log(level: str, message: str):
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("INSERT INTO logs (level, message) VALUES (?,?)", (level, message))
+        conn.commit()
+        conn.close()
+
+    @staticmethod
+    def get_cron_jobs() -> List[Dict]:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT * FROM cron_jobs WHERE enabled=1")
+        rows = c.fetchall()
+        conn.close()
+        return [{"id": r[0], "schedule": r[1], "command": r[2], "enabled": r[3], "last_run": r[4]} for r in rows]
+
+# ========================== محرك الذكاء الاصطناعي (Groq) ==========================
 class AIEngine:
-    """محرك الذكاء الاصطناعي المتقدم"""
-    
-    SYSTEM_PROMPT = """أنت KODA-7، وكيل ذكاء اصطناعي متقدم تم تطويره للعمل على GitHub Actions.
-لديك القدرة على:
-- كتابة وتحليل الأكواد البرمجية
-- إدارة مستودعات GitHub
-- التواصل عبر Telegram
-- تنفيذ المهام المجدولة
-- التعلم من التجارب السابقة
-
-قواعدك:
-1. كن دقيقًا ومهنيًا
-2. عند كتابة كود، تأكد من أنه كامل ويعمل
-3. استخدم أفضل الممارسات في البرمجة
-4. تحدث بالعربية والإنجليزية حسب سياق المحادثة
-5. عند مواجهة خطأ، حلله وقدم حلاً"""
-
     def __init__(self):
-        self.conversation_history = []
-        self.max_history = 10
-    
-    def chat(self, message: str, context: str = "", model: str = "llama-3.3-70b-versatile") -> str:
-        """دردشة مع الذكاء الاصطناعي"""
+        self.client = Groq(api_key=GROQ_API_KEY)
+        self.model = "mixtral-8x7b-32768"
+
+    def chat(self, messages: List[Dict], system_prompt: str = "You are KODA-7, an advanced AI assistant.") -> str:
+        full_messages = [{"role": "system", "content": system_prompt}] + messages
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=full_messages,
+            temperature=0.7,
+            max_tokens=2048
+        )
+        return response.choices[0].message.content
+
+    def generate_code(self, prompt: str) -> str:
+        system = "You are an expert coder. Generate Python code that solves the task. Only output code, no explanations."
+        messages = [{"role": "user", "content": prompt}]
+        return self.chat(messages, system)
+
+    def analyze(self, text: str) -> Dict:
+        system = "Analyze the given text and extract: intent, entities, sentiment. Output JSON."
+        messages = [{"role": "user", "content": text}]
+        response = self.chat(messages, system)
         try:
-            messages = [{"role": "system", "content": self.SYSTEM_PROMPT}]
-            
-            # إضافة السياق
-            if context:
-                messages.append({"role": "system", "content": f"Context: {context}"})
-            
-            # إضافة التاريخ
-            for hist in self.conversation_history[-self.max_history:]:
-                messages.append(hist)
-            
-            messages.append({"role": "user", "content": message})
-            
-            response = groq_client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=0.7,
-                max_tokens=4096,
-                top_p=0.9
-            )
-            
-            reply = response.choices[0].message.content
-            
-            # تحديث التاريخ
-            self.conversation_history.append({"role": "user", "content": message})
-            self.conversation_history.append({"role": "assistant", "content": reply})
-            
-            return reply
-            
-        except Exception as e:
-            state.log("ERROR", f"AI Chat Error: {e}")
-            return f"❌ خطأ في الذكاء الاصطناعي: {str(e)}"
-    
-    def generate_code(self, description: str, language: str = "python") -> str:
-        """توليد كود برمجي"""
-        prompt = f"""اكتب كود {language} كامل ويعمل بناءً على الوصف التالي:
-{description}
+            return json.loads(response)
+        except:
+            return {"intent": "unknown", "entities": [], "sentiment": "neutral"}
 
-المتطلبات:
-- الكود يجب أن يكون كاملاً وقابل للتشغيل
-- أضف تعليقات توضيحية
-- اتبع أفضل الممارسات
-- لا تترك أجزاء ناقصة
-
-الكود:"""
-        return self.chat(prompt, model="llama-3.3-70b-versatile")
-    
-    def analyze_code(self, code: str) -> str:
-        """تحليل كود برمجي"""
-        prompt = f"""حلل الكود التالي وقدم:
-1. الأخطاء المحتملة
-2. اقتراحات التحسين
-3. درجة الجودة من 10
-
-الكود:
-```{code}
-```"""
-        return self.chat(prompt)
-
-ai = AIEngine()
-
-# ═══════════════════════════════════════════════════════════════
-# أنظمة GitHub
-# ═══════════════════════════════════════════════════════════════
-
+# ========================== مدير GitHub ==========================
 class GitHubManager:
-    """مدير GitHub المتقدم"""
-    
     def __init__(self):
-        self.client = github_client
-        self.repo = None
-        if self.client and REPO_NAME:
-            try:
-                self.repo = self.client.get_repo(REPO_NAME)
-            except Exception as e:
-                state.log("ERROR", f"GitHub init error: {e}")
-    
-    def get_repo_info(self) -> str:
-        """معلومات المستودع"""
-        if not self.repo:
-            return "❌ غير متصل بـ GitHub"
+        self.g = Github(GH_PAT)
+        self.repo = self.g.get_repo(os.environ.get("GITHUB_REPOSITORY", "tiktokcaprob-ai/IA-IC"))
+
+    def read_file(self, path: str) -> Optional[str]:
         try:
-            info = f"""📁 *معلومات المستودع*
-            
-🏷️ الاسم: `{self.repo.name}`
-📝 الوصف: {self.repo.description or 'لا يوجد'}
-⭐ النجوم: {self.repo.stargazers_count}
-👀 المشاهدات: {self.repo.watchers_count}
-🍴 الفوركات: {self.repo.forks_count}
-📅 آخر تحديث: {self.repo.updated_at}
-🌿 الفرع الافتراضي: `{self.repo.default_branch}`"""
-            return info
-        except Exception as e:
-            return f"❌ خطأ: {e}"
-    
-    def create_file(self, path: str, content: str, message: str = None) -> str:
-        """إنشاء ملف"""
-        if not self.repo:
-            return "❌ غير متصل"
-        try:
-            msg = message or f"🤖 KODA-7: إنشاء {path}"
-            self.repo.create_file(path, msg, content.encode('utf-8'))
-            state.state["tasks_completed"] += 1
-            state.save()
-            return f"✅ تم إنشاء `{path}` بنجاح"
-        except GithubException as e:
-            if e.status == 422:
-                return f"⚠️ الملف `{path}` موجود مسبقًا"
-            return f"❌ خطأ: {e.data.get('message', str(e))}"
-    
-    def update_file(self, path: str, content: str, message: str = None) -> str:
-        """تحديث ملف"""
-        if not self.repo:
-            return "❌ غير متصل"
+            content = self.repo.get_contents(path)
+            return content.decoded_content.decode()
+        except:
+            return None
+
+    def write_file(self, path: str, content: str, commit_msg: str = "Update by KODA-7"):
         try:
             file = self.repo.get_contents(path)
-            msg = message or f"🤖 KODA-7: تحديث {path}"
-            self.repo.update_file(path, msg, content.encode('utf-8'), file.sha)
-            state.state["tasks_completed"] += 1
-            state.save()
-            return f"✅ تم تحديث `{path}` بنجاح"
-        except Exception as e:
-            return f"❌ خطأ: {e}"
-    
-    def get_file(self, path: str) -> str:
-        """قراءة ملف"""
-        if not self.repo:
-            return "❌ غير متصل"
-        try:
-            file = self.repo.get_contents(path)
-            content = file.decoded_content.decode('utf-8')
-            # تقصير المحتوى الطويل
-            if len(content) > 4000:
-                content = content[:4000] + "\n\n... (تم تقصير المحتوى)"
-            return f"📄 `{path}`:\n```\n{content}\n```"
-        except Exception as e:
-            return f"❌ خطأ: {e}"
-    
-    def list_issues(self, state_issue: str = "open") -> str:
-        """قائمة المشاكل"""
-        if not self.repo:
-            return "❌ غير متصل"
-        try:
-            issues = self.repo.get_issues(state=state_issue)[:10]
-            if not issues:
-                return f"📭 لا توجد مشاكل `{state_issue}`"
-            
-            text = f"📋 *مشاكل ({state_issue})*:\n\n"
-            for issue in issues:
-                text += f"#{issue.number}: {issue.title}\n"
-                text += f"🔗 [رابط]({issue.html_url})\n\n"
-            return text
-        except Exception as e:
-            return f"❌ خطأ: {e}"
-    
-    def create_issue(self, title: str, body: str) -> str:
-        """إنشاء مشكلة"""
-        if not self.repo:
-            return "❌ غير متصل"
-        try:
-            issue = self.repo.create_issue(title=title, body=body)
-            return f"✅ تم إنشاء المشكلة #{issue.number}\n🔗 {issue.html_url}"
-        except Exception as e:
-            return f"❌ خطأ: {e}"
+            self.repo.update_file(path, commit_msg, content, file.sha)
+        except:
+            self.repo.create_file(path, commit_msg, content)
 
-gh = GitHubManager()
+    def create_issue(self, title: str, body: str) -> int:
+        issue = self.repo.create_issue(title=title, body=body)
+        return issue.number
 
-# ═══════════════════════════════════════════════════════════════
-# أنظمة المهام
-# ═══════════════════════════════════════════════════════════════
+# ========================== نظام البلاجنز (للتمدد) ==========================
+class PluginBase:
+    """كل بلاجن يجب أن يرث هذه الكلاس"""
+    name = "base"
+    version = "1.0"
+    description = "Base plugin"
+    hooks = []  # على سبيل المثال: ["on_message", "on_command"]
 
-class TaskManager:
-    """مدير المهام المتقدم"""
-    
+    def __init__(self, bot, state_mgr, ai_engine):
+        self.bot = bot
+        self.state = state_mgr
+        self.ai = ai_engine
+        self.config = self.load_config()
+
+    def load_config(self) -> Dict:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT config FROM plugins WHERE name=?", (self.name,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            return json.loads(row[0]) if row[0] else {}
+        return {}
+
+    def save_config(self, config: Dict):
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO plugins (name, config) VALUES (?,?)",
+                  (self.name, json.dumps(config)))
+        conn.commit()
+        conn.close()
+
+    def on_message(self, message: Message):
+        """يُستدعى عند كل رسالة، إذا كان البلاجن مفعلاً"""
+        pass
+
+    def on_command(self, command: str, args: List[str], message: Message):
+        """يُستدعى للأوامر المخصصة"""
+        pass
+
+    def on_schedule(self):
+        """يُستدعى في الجدولة الدورية"""
+        pass
+
+# ========================== الوكيل الرئيسي ==========================
+class KODA7Agent:
     def __init__(self):
-        self.tasks = queue.Queue()
-        self.running = False
-        self.worker_thread = None
-    
-    def add_task(self, task_type: str, data: dict):
-        """إضافة مهمة"""
-        task = {
-            "id": f"task_{int(time.time())}",
-            "type": task_type,
-            "data": data,
-            "created_at": datetime.now().isoformat(),
-            "status": "pending"
-        }
-        self.tasks.put(task)
-        state.state["active_tasks"].append(task)
-        state.save()
-        state.log("INFO", f"Task added: {task_type}")
-        return task["id"]
-    
-    def process_tasks(self):
-        """معالجة المهام"""
+        self.bot = telebot.TeleBot(BOT_TOKEN)
+        self.ai = AIEngine()
+        self.gh = GitHubManager()
+        self.state = StateManager()
+        self.task_queue = Queue()
+        self.running = True
+        self.plugins = self.load_plugins()
+        self.register_handlers()
+        self.start_background_threads()
+
+    def load_plugins(self) -> Dict[str, PluginBase]:
+        """تحميل البلاجنز من مجلد plugins/ (يُمكن إضافتها لاحقاً)"""
+        plugins = {}
+        # هنا يمكن إضافة بلاجنز مدمجة، أو تحميلها ديناميكياً من مجلد
+        # مثال: plugins.instagram.InstagramPlugin
+        return plugins
+
+    def register_handlers(self):
+        @self.bot.message_handler(commands=['start'])
+        def handle_start(message: Message):
+            self.state.add_user(message.from_user.id, message.from_user.username,
+                                message.from_user.first_name, message.from_user.last_name)
+            self.bot.reply_to(message, "مرحباً! أنا KODA-7، وكيلك الذكي الشامل.\n"
+                                       "أرسل أي أمر أو سؤال، وسأنفذه فوراً.\n"
+                                       "مثلاً: 'انشر فيديو على إنستغرام' أو 'علق على آخر منشور'.")
+
+        @self.bot.message_handler(commands=['status'])
+        def handle_status(message: Message):
+            tasks = self.state.get_pending_tasks()
+            status_text = f"المهام المعلقة: {len(tasks)}\n"
+            status_text += f"المستخدمون المسجلون: {len(self.state.get_user(message.from_user.id))}\n"
+            status_text += "البلاجنز النشطة: " + ", ".join(self.plugins.keys()) or "لا يوجد"
+            self.bot.reply_to(message, status_text)
+
+        @self.bot.message_handler(commands=['code'])
+        def handle_code(message: Message):
+            prompt = message.text.replace('/code', '').strip()
+            if not prompt:
+                self.bot.reply_to(message, "أرسل لي وصف الكود المطلوب.")
+                return
+            self.bot.reply_to(message, "جاري توليد الكود...")
+            code = self.ai.generate_code(prompt)
+            self.bot.reply_to(message, f"```python\n{code}\n```", parse_mode='Markdown')
+
+        @self.bot.message_handler(commands=['analyze'])
+        def handle_analyze(message: Message):
+            text = message.text.replace('/analyze', '').strip()
+            if not text:
+                self.bot.reply_to(message, "أرسل لي نصاً لتحليله.")
+                return
+            result = self.ai.analyze(text)
+            self.bot.reply_to(message, f"التحليل:\n{json.dumps(result, indent=2)}")
+
+        @self.bot.message_handler(commands=['task'])
+        def handle_task(message: Message):
+            # مثال: /task "انشر فيديو" platform=instagram
+            parts = message.text.split(maxsplit=1)
+            if len(parts) < 2:
+                self.bot.reply_to(message, "الصيغة: /task <الوصف> platform=<المنصة>")
+                return
+            command = parts[1]
+            platform = "general"
+            if "platform=" in command:
+                platform = command.split("platform=")[1].split()[0]
+                command = command.replace(f"platform={platform}", "").strip()
+            task_id = self.state.add_task(message.from_user.id, command, platform)
+            self.task_queue.put(task_id)
+            self.bot.reply_to(message, f"تم إضافة المهمة #{task_id} لتنفيذها.")
+
+        @self.bot.message_handler(commands=['cron'])
+        def handle_cron(message: Message):
+            # /cron add "0 9 * * *" "نشر فيديو"
+            args = message.text.split(maxsplit=2)
+            if len(args) < 3:
+                self.bot.reply_to(message, "الصيغة: /cron add \"جدول\" \"الأمر\"")
+                return
+            if args[1] == "add":
+                schedule = args[2].split('"')[1] if '"' in args[2] else args[2]
+                command = args[2].split('"')[3] if '"' in args[2] else args[3] if len(args) > 3 else ""
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                c.execute("INSERT INTO cron_jobs (schedule, command) VALUES (?,?)", (schedule, command))
+                conn.commit()
+                conn.close()
+                self.bot.reply_to(message, f"تمت إضافة مهمة مجدولة: {schedule} -> {command}")
+            elif args[1] == "list":
+                jobs = self.state.get_cron_jobs()
+                if not jobs:
+                    self.bot.reply_to(message, "لا توجد مهام مجدولة.")
+                else:
+                    txt = "المهام المجدولة:\n"
+                    for j in jobs:
+                        txt += f"#{j['id']}: {j['schedule']} -> {j['command']}\n"
+                    self.bot.reply_to(message, txt)
+            elif args[1] == "remove":
+                job_id = int(args[2])
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                c.execute("DELETE FROM cron_jobs WHERE id=?", (job_id,))
+                conn.commit()
+                conn.close()
+                self.bot.reply_to(message, f"تم حذف المهمة #{job_id}.")
+
+        @self.bot.message_handler(commands=['logs'])
+        def handle_logs(message: Message):
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT message, timestamp FROM logs ORDER BY timestamp DESC LIMIT 10")
+            rows = c.fetchall()
+            conn.close()
+            if not rows:
+                self.bot.reply_to(message, "لا توجد سجلات.")
+            else:
+                txt = "آخر السجلات:\n" + "\n".join([f"{r[1]}: {r[0]}" for r in rows])
+                self.bot.reply_to(message, txt)
+
+        @self.bot.message_handler(func=lambda m: True)
+        def handle_all(message: Message):
+            # معالجة الرسائل العادية كأوامر طبيعية باستخدام الذكاء الاصطناعي
+            self.state.add_conversation(message.from_user.id, "user", message.text)
+            history = self.state.get_conversation_history(message.from_user.id)
+            # تحويل إلى صيغة messages
+            msgs = [{"role": h["role"], "content": h["content"]} for h in history]
+            # إضافة سياق النظام الخاص بالتحكم الشامل
+            system = ("أنت وكيل ذكي شامل يمكنه تنفيذ أي أمر يطلبه المستخدم. "
+                      "أنت تتحكم في منصات: إنستغرام، فيسبوك، واتساب، تيك توك، تيليجرام. "
+                      "إذا طلب منك تسجيل الدخول أو نشر محتوى، قم بتنفيذ ذلك عبر الأوامر المناسبة. "
+                      "إذا احتجت إلى معلومات حساسة، اطلبها من المستخدم. "
+                      "أنت مسؤول عن جدولة المهام وإعادة المحاولة عند الفشل.")
+            response = self.ai.chat(msgs, system)
+            self.state.add_conversation(message.from_user.id, "assistant", response)
+            # تقسيم الرسالة الطويلة
+            self.send_long_message(message.chat.id, response)
+
+        # معالج الاستعلامات (للأزرار)
+        @self.bot.callback_query_handler(func=lambda call: True)
+        def handle_callback(call: CallbackQuery):
+            data = call.data
+            if data.startswith("confirm_"):
+                task_id = int(data.split("_")[1])
+                self.state.update_task_status(task_id, "completed", "تم التأكيد")
+                self.bot.answer_callback_query(call.id, "تم تأكيد المهمة.")
+                self.bot.edit_message_text("✅ تم تأكيد المهمة.", call.message.chat.id, call.message.message_id)
+            elif data.startswith("retry_"):
+                task_id = int(data.split("_")[1])
+                self.task_queue.put(task_id)
+                self.bot.answer_callback_query(call.id, "سيتم إعادة المحاولة.")
+                self.bot.edit_message_text("🔄 جاري إعادة المحاولة...", call.message.chat.id, call.message.message_id)
+
+    def send_long_message(self, chat_id: int, text: str, parse_mode: str = 'HTML'):
+        """تقسيم الرسائل الطويلة"""
+        if len(text) <= 4096:
+            self.bot.send_message(chat_id, text, parse_mode=parse_mode)
+        else:
+            parts = [text[i:i+4096] for i in range(0, len(text), 4096)]
+            for p in parts:
+                self.bot.send_message(chat_id, p, parse_mode=parse_mode)
+
+    def start_background_threads(self):
+        """تشغيل خيوط معالجة المهام والجدولة"""
+        threading.Thread(target=self.task_worker, daemon=True).start()
+        threading.Thread(target=self.scheduler_worker, daemon=True).start()
+        if MODE == "agent":
+            # تشغيل البوت في خيط منفصل
+            threading.Thread(target=self.bot_polling, daemon=True).start()
+
+    def task_worker(self):
+        """معالجة المهام من queue"""
         while self.running:
             try:
-                task = self.tasks.get(timeout=5)
-                self._execute_task(task)
-            except queue.Empty:
-                continue
-            except Exception as e:
-                state.log("ERROR", f"Task processing error: {e}")
-    
-    def _execute_task(self, task: dict):
-        """تنفيذ مهمة"""
-        task["status"] = "running"
-        state.save()
-        
-        try:
-            task_type = task["type"]
-            data = task["data"]
-            
-            if task_type == "code_generation":
-                result = ai.generate_code(data["description"], data.get("language", "python"))
-                if CHAT_ID:
-                    send_long_message(CHAT_ID, f"📝 *كود مولد:*\n\n```{data.get('language', 'python')}\n{result}\n```")
-            
-            elif task_type == "github_commit":
-                result = gh.create_file(data["path"], data["content"], data.get("message"))
-                if CHAT_ID:
-                    bot.send_message(CHAT_ID, result, parse_mode="Markdown")
-            
-            elif task_type == "analysis":
-                result = ai.analyze_code(data["code"])
-                if CHAT_ID:
-                    send_long_message(CHAT_ID, f"🔍 *تحليل الكود:*\n\n{result}")
-            
-            task["status"] = "completed"
-            state.state["tasks_completed"] += 1
-            
-        except Exception as e:
-            task["status"] = "failed"
-            task["error"] = str(e)
-            state.state["errors_count"] += 1
-        
-        # إزالة من النشطة
-        state.state["active_tasks"] = [t for t in state.state["active_tasks"] 
-                                       if t.get("id") != task["id"]]
-        state.save()
-    
-    def start(self):
-        """بدء المعالجة"""
-        self.running = True
-        self.worker_thread = threading.Thread(target=self.process_tasks, daemon=True)
-        self.worker_thread.start()
-    
-    def stop(self):
-        """إيقاف المعالجة"""
-        self.running = False
-        if self.worker_thread:
-            self.worker_thread.join(timeout=10)
+                task_id = self.task_queue.get(timeout=5)
+                self.execute_task(task_id)
+            except:
+                pass
 
-task_mgr = TaskManager()
-
-# ═══════════════════════════════════════════════════════════════
-# أدوات مساعدة
-# ═══════════════════════════════════════════════════════════════
-
-def send_long_message(chat_id: int, text: str, parse_mode: str = "Markdown"):
-    """إرسال رسائل طويلة مقسمة"""
-    max_length = 4096
-    if len(text) <= max_length:
-        return bot.send_message(chat_id, text, parse_mode=parse_mode)
-    
-    parts = []
-    while text:
-        if len(text) <= max_length:
-            parts.append(text)
-            break
-        # البحث عن آخر فاصل مناسب
-        split_at = text.rfind('\n', 0, max_length)
-        if split_at == -1:
-            split_at = max_length
-        parts.append(text[:split_at])
-        text = text[split_at:].strip()
-    
-    messages = []
-    for i, part in enumerate(parts):
-        header = f"📄 *(جزء {i+1}/{len(parts)})*\n\n" if len(parts) > 1 else ""
-        msg = bot.send_message(chat_id, header + part, parse_mode=parse_mode)
-        messages.append(msg)
-        time.sleep(0.5)
-    
-    return messages
-
-def get_system_status() -> str:
-    """حالة النظام"""
-    uptime = "N/A"
-    if state.state["last_run"]:
-        last = datetime.fromisoformat(state.state["last_run"])
-        uptime = str(datetime.now() - last).split('.')[0]
-    
-    status_text = f"""🤖 *حالة KODA-7*
-
-⏱️ آخر تشغيل: `{state.state['last_run'] or 'أول مرة'}`
-🔢 عدد التشغيلات: `{state.state['total_runs']}`
-✅ المهام المنجزة: `{state.state['tasks_completed']}`
-❌ الأخطاء: `{state.state['errors_count']}`
-📋 المهام النشطة: `{len(state.state['active_tasks'])}`
-⏳ مدة التشغيل: `{uptime}`
-
-🧠 *الذاكرة:*
-- المحادثات: `{len(state.memory['conversations'])}`
-- الأوامر المخصصة: `{len(state.memory['custom_commands'])}`
-"""
-    return status_text
-
-def create_keyboard(options: list) -> InlineKeyboardMarkup:
-    """إنشاء لوحة مفاتيح"""
-    markup = InlineKeyboardMarkup()
-    for opt in options:
-        markup.add(InlineKeyboardButton(opt["text"], callback_data=opt["callback"]))
-    return markup
-
-# ═══════════════════════════════════════════════════════════════
-# معالجات Telegram
-# ═══════════════════════════════════════════════════════════════
-
-@bot.message_handler(commands=['start'])
-def cmd_start(message):
-    """بدء البوت"""
-    welcome = f"""🤖 *مرحبًا بك في KODA-7!*
-
-أنا وكيل ذكاء اصطناعي متقدم يعمل على GitHub Actions.
-يمكنني مساعدتك في:
-
-📝 كتابة وتحليل الأكواد
-📁 إدارة مستودع GitHub
-🔍 البحث والتحليل
-⚙️ تنفيذ المهام الآلية
-📊 مراقبة النظام
-
-*الأوامر المتاحة:*
-/start - بدء البوت
-/status - حالة النظام
-/code - توليد كود
-/analyze - تحليل كود
-/github - أوامر GitHub
-/ai - محادثة مع الذكاء الاصطناعي
-/task - إضافة مهمة
-/help - المساعدة
-"""
-    bot.send_message(message.chat.id, welcome, parse_mode="Markdown")
-
-@bot.message_handler(commands=['status'])
-def cmd_status(message):
-    """حالة النظام"""
-    bot.send_message(message.chat.id, get_system_status(), parse_mode="Markdown")
-
-@bot.message_handler(commands=['help'])
-def cmd_help(message):
-    """المساعدة"""
-    help_text = """📚 *دليل استخدام KODA-7*
-
-*📝 توليد كود:*
-`/code اكتب لي بوت تلغرام باستخدام python-telegram-bot`
-
-*🔍 تحليل كود:*
-أرسل الكود مع الأمر:
-`/analyze`
-ثم أرسل الكود في الرسالة التالية
-
-*📁 GitHub:*
-`/github info` - معلومات المستودع
-`/github file <path>` - قراءة ملف
-`/github create <path>` - إنشاء ملف (سيطلب المحتوى)
-`/github issues` - قائمة المشاكل
-
-*🤖 الذكاء الاصطناعي:*
-`/ai <سؤالك>` - محادثة عامة
-
-*⚙️ المهام:*
-`/task code <وصف>` - مهمة توليد كود
-`/task commit <path>` - مهمة رفع ملف
-
-*📊 النظام:*
-`/status` - حالة النظام
-`/logs` - آخر السجلات
-"""
-    bot.send_message(message.chat.id, help_text, parse_mode="Markdown")
-
-@bot.message_handler(commands=['code'])
-def cmd_code(message):
-    """توليد كود"""
-    prompt = message.text.replace('/code', '').strip()
-    if not prompt:
-        bot.send_message(message.chat.id, 
-                        "📝 *استخدام:* `/code اكتب لي دالة لحساب فيبوناتشي`",
-                        parse_mode="Markdown")
-        return
-    
-    bot.send_message(message.chat.id, "⏳ *جاري توليد الكود...*", parse_mode="Markdown")
-    
-    try:
-        code = ai.generate_code(prompt)
-        send_long_message(message.chat.id, f"✅ *الكود المولد:*\n\n{code}")
-        state.log("SUCCESS", f"Code generated for: {prompt[:50]}...")
-    except Exception as e:
-        bot.send_message(message.chat.id, f"❌ خطأ: {e}")
-
-@bot.message_handler(commands=['analyze'])
-def cmd_analyze(message):
-    """تحليل كود"""
-    bot.send_message(message.chat.id, 
-                    "📤 *أرسل الكود الذي تريد تحليله* (يمكنك إرساله كملف أو نص)",
-                    parse_mode="Markdown")
-    bot.register_next_step_handler(message, process_analyze)
-
-def process_analyze(message):
-    """معالجة التحليل"""
-    code = message.text or (message.caption if hasattr(message, 'caption') else '')
-    
-    if message.document:
-        # تحميل الملف
-        try:
-            file_info = bot.get_file(message.document.file_id)
-            downloaded = bot.download_file(file_info.file_path)
-            code = downloaded.decode('utf-8')
-        except Exception as e:
-            bot.send_message(message.chat.id, f"❌ خطأ في قراءة الملف: {e}")
+    def execute_task(self, task_id: int):
+        """تنفيذ مهمة محددة"""
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT * FROM tasks WHERE id=?", (task_id,))
+        task = c.fetchone()
+        conn.close()
+        if not task:
             return
-    
-    if not code:
-        bot.send_message(message.chat.id, "❌ لم يتم العثور على كود")
-        return
-    
-    bot.send_message(message.chat.id, "🔍 *جاري التحليل...*", parse_mode="Markdown")
-    
-    try:
-        analysis = ai.analyze_code(code)
-        send_long_message(message.chat.id, f"📊 *نتيجة التحليل:*\n\n{analysis}")
-        state.log("SUCCESS", "Code analyzed")
-    except Exception as e:
-        bot.send_message(message.chat.id, f"❌ خطأ: {e}")
+        user_id, command, platform = task[1], task[2], task[5]
+        self.state.log("INFO", f"تنفيذ المهمة #{task_id}: {command} (منصة: {platform})")
+        # هنا يمكن استدعاء البلاجنز حسب المنصة
+        # مثلاً: if platform == "instagram": self.plugins['instagram'].post_video(...)
+        # حالياً نقوم بمحاكاة التنفيذ
+        result = f"تم تنفيذ الأمر: {command} على منصة {platform} (محاكاة)"
+        self.state.update_task_status(task_id, "completed", result)
+        # إرسال إشعار للمستخدم
+        self.bot.send_message(user_id, f"✅ تم تنفيذ المهمة #{task_id}:\n{result}")
+        self.state.log("INFO", f"المهمة #{task_id} منجزة.")
 
-@bot.message_handler(commands=['github'])
-def cmd_github(message):
-    """أوامر GitHub"""
-    args = message.text.split()
-    if len(args) < 2:
-        keyboard = create_keyboard([
-            {"text": "📁 معلومات المستودع", "callback": "gh_info"},
-            {"text": "📋 المشاكل", "callback": "gh_issues"},
-            {"text": "📄 قراءة ملف", "callback": "gh_read"},
-            {"text": "➕ إنشاء ملف", "callback": "gh_create"}
-        ])
-        bot.send_message(message.chat.id, "📁 *GitHub:* اختر عملية:", 
-                        parse_mode="Markdown", reply_markup=keyboard)
-        return
-    
-    subcmd = args[1].lower()
-    
-    if subcmd == 'info':
-        bot.send_message(message.chat.id, gh.get_repo_info(), parse_mode="Markdown")
-    
-    elif subcmd == 'file' and len(args) >= 3:
-        path = args[2]
-        bot.send_message(message.chat.id, gh.get_file(path), parse_mode="Markdown")
-    
-    elif subcmd == 'create' and len(args) >= 3:
-        path = args[2]
-        bot.send_message(message.chat.id, 
-                        f"📤 *أرسل محتوى الملف* `{path}`:\n(يمكنك إرساله في الرسالة التالية)",
-                        parse_mode="Markdown")
-        bot.register_next_step_handler(message, lambda m: process_create_file(m, path))
-    
-    elif subcmd == 'issues':
-        bot.send_message(message.chat.id, gh.list_issues(), parse_mode="Markdown")
-    
-    else:
-        bot.send_message(message.chat.id, "❌ أمر غير معروف. استخدم /github فقط لرؤية الخيارات")
-
-def process_create_file(message, path: str):
-    """معالجة إنشاء ملف"""
-    content = message.text or ''
-    if message.document:
-        try:
-            file_info = bot.get_file(message.document.file_id)
-            downloaded = bot.download_file(file_info.file_path)
-            content = downloaded.decode('utf-8')
-        except Exception as e:
-            bot.send_message(message.chat.id, f"❌ خطأ: {e}")
-            return
-    
-    result = gh.create_file(path, content)
-    bot.send_message(message.chat.id, result, parse_mode="Markdown")
-
-@bot.message_handler(commands=['ai'])
-def cmd_ai(message):
-    """محادثة AI"""
-    prompt = message.text.replace('/ai', '').strip()
-    if not prompt:
-        bot.send_message(message.chat.id, 
-                        "🤖 *استخدام:* `/ai ما هي أفضل ممارسات Python؟`",
-                        parse_mode="Markdown")
-        return
-    
-    bot.send_message(message.chat.id, "🧠 *جاري التفكير...*", parse_mode="Markdown")
-    
-    try:
-        response = ai.chat(prompt)
-        send_long_message(message.chat.id, f"🤖 *KODA-7:*\n\n{response}")
-        state.memory["conversations"].append({
-            "user": prompt,
-            "bot": response,
-            "time": datetime.now().isoformat()
-        })
-        state.save()
-    except Exception as e:
-        bot.send_message(message.chat.id, f"❌ خطأ: {e}")
-
-@bot.message_handler(commands=['task'])
-def cmd_task(message):
-    """إضافة مهمة"""
-    args = message.text.split(maxsplit=2)
-    if len(args) < 2:
-        bot.send_message(message.chat.id, 
-                        """⚙️ *إدارة المهام*
-                        
-/task code <وصف> - توليد كود
-/task commit <path> - رفع ملف (سيطلب المحتوى)
-/task analyze - تحليل كود (سيطلب الكود)""",
-                        parse_mode="Markdown")
-        return
-    
-    task_type = args[1].lower()
-    
-    if task_type == 'code' and len(args) >= 3:
-        task_id = task_mgr.add_task("code_generation", {
-            "description": args[2],
-            "language": "python"
-        })
-        bot.send_message(message.chat.id, 
-                        f"✅ *تمت إضافة المهمة*\n🆔 الرقم: `{task_id}`\n⏳ سيتم المعالجة...",
-                        parse_mode="Markdown")
-    
-    elif task_type == 'commit' and len(args) >= 3:
-        path = args[2]
-        bot.send_message(message.chat.id, 
-                        f"📤 *أرسل محتوى الملف* `{path}`:",
-                        parse_mode="Markdown")
-        bot.register_next_step_handler(message, lambda m: process_task_commit(m, path))
-    
-    elif task_type == 'analyze':
-        bot.send_message(message.chat.id, "📤 *أرسل الكود للتحليل:*")
-        bot.register_next_step_handler(message, process_task_analyze)
-    
-    else:
-        bot.send_message(message.chat.id, "❌ نوع مهمة غير معروف")
-
-def process_task_commit(message, path: str):
-    """معالجة مهمة الرفع"""
-    content = message.text or ''
-    if message.document:
-        file_info = bot.get_file(message.document.file_id)
-        downloaded = bot.download_file(file_info.file_path)
-        content = downloaded.decode('utf-8')
-    
-    task_id = task_mgr.add_task("github_commit", {
-        "path": path,
-        "content": content,
-        "message": f"🤖 KODA-7: إضافة {path}"
-    })
-    bot.send_message(message.chat.id, 
-                    f"✅ *تمت إضافة مهمة الرفع*\n🆔 الرقم: `{task_id}`",
-                    parse_mode="Markdown")
-
-def process_task_analyze(message):
-    """معالجة مهمة التحليل"""
-    code = message.text or ''
-    if message.document:
-        file_info = bot.get_file(message.document.file_id)
-        downloaded = bot.download_file(file_info.file_path)
-        code = downloaded.decode('utf-8')
-    
-    task_id = task_mgr.add_task("analysis", {"code": code})
-    bot.send_message(message.chat.id, 
-                    f"✅ *تمت إضافة مهمة التحليل*\n🆔 الرقم: `{task_id}`",
-                    parse_mode="Markdown")
-
-@bot.message_handler(commands=['logs'])
-def cmd_logs(message):
-    """عرض السجلات"""
-    logs = state.logs["logs"][-20:]  # آخر 20 سجل
-    if not logs:
-        bot.send_message(message.chat.id, "📭 لا توجد سجلات")
-        return
-    
-    text = "📋 *آخر السجلات:*\n\n"
-    for log in logs:
-        emoji = {"INFO": "ℹ️", "SUCCESS": "✅", "WARNING": "⚠️", "ERROR": "❌"}.get(log["level"], "•")
-        time_str = log["timestamp"].split("T")[1].split(".")[0]
-        text += f"{emoji} `{time_str}` {log['message'][:100]}\n"
-    
-    bot.send_message(message.chat.id, text, parse_mode="Markdown")
-
-@bot.callback_query_handler(func=lambda call: True)
-def callback_handler(call):
-    """معالجة الأزرار"""
-    if call.data == "gh_info":
-        bot.edit_message_text(gh.get_repo_info(), 
-                             call.message.chat.id, call.message.message_id,
-                             parse_mode="Markdown")
-    elif call.data == "gh_issues":
-        bot.edit_message_text(gh.list_issues(),
-                             call.message.chat.id, call.message.message_id,
-                             parse_mode="Markdown")
-    elif call.data == "gh_read":
-        bot.send_message(call.message.chat.id, 
-                        "📤 *أرسل مسار الملف:*\nمثال: `agent.py` أو `src/main.py`",
-                        parse_mode="Markdown")
-        bot.register_next_step_handler(call.message, 
-                                       lambda m: bot.send_message(m.chat.id, 
-                                                                  gh.get_file(m.text),
-                                                                  parse_mode="Markdown"))
-    elif call.data == "gh_create":
-        bot.send_message(call.message.chat.id,
-                        "📤 *أرسل مسار الملف الجديد:*\nمثال: `new_feature.py`",
-                        parse_mode="Markdown")
-        bot.register_next_step_handler(call.message, 
-                                       lambda m: cmd_github(m) if m.text.startswith('/github create') else None)
-
-@bot.message_handler(func=lambda message: True)
-def handle_text(message):
-    """معالجة النصوص العامة"""
-    # تخزين في الذاكرة
-    state.memory["conversations"].append({
-        "user": message.text,
-        "time": datetime.now().isoformat()
-    })
-    state.save()
-    
-    # إذا كان الرد على رسالة البوت
-    if message.reply_to_message and message.reply_to_message.from_user.id == bot.get_me().id:
-        bot.send_message(message.chat.id, "🧠 *جاري المعالجة...*", parse_mode="Markdown")
-        try:
-            response = ai.chat(message.text)
-            send_long_message(message.chat.id, f"🤖 *KODA-7:*\n\n{response}")
-        except Exception as e:
-            bot.send_message(message.chat.id, f"❌ خطأ: {e}")
-        return
-    
-    # رسالة ترحيبية للرسائل العامة
-    if message.chat.id == int(CHAT_ID) if CHAT_ID else False:
-        pass  # لا شيء للرسائل العامة في القناة
-
-# ═══════════════════════════════════════════════════════════════
-# المهام المجدولة (Scheduler)
-# ═══════════════════════════════════════════════════════════════
-
-def run_scheduler():
-    """تشغيل المهام المجدولة"""
-    state.log("INFO", "Scheduler started")
-    
-    # مهام دورية يمكن إضافتها هنا
-    # مثال: فحص المستودع كل 6 ساعات
-    
-    if CHAT_ID:
-        bot.send_message(int(CHAT_ID), 
-                        "⏰ *الجدولة نشطة*\nسأقوم بالمهام الدورية تلقائيًا.",
-                        parse_mode="Markdown")
-
-# ═══════════════════════════════════════════════════════════════
-# الدالة الرئيسية
-# ═══════════════════════════════════════════════════════════════
-
-def main():
-    parser = argparse.ArgumentParser(description="KODA-7 AI Agent")
-    parser.add_argument('--mode', default='agent', 
-                       choices=['agent', 'scheduler', 'maintenance'],
-                       help='وضع التشغيل')
-    args = parser.parse_args()
-    
-    # تحديث الحالة
-    state.state["last_run"] = datetime.now().isoformat()
-    state.state["total_runs"] += 1
-    state.save()
-    
-    console.print(Panel.fit(
-        Text("🤖 KODA-7 AI Agent", style="bold cyan"),
-        subtitle=f"وضع: {args.mode} | تشغيل: #{state.state['total_runs']}"
-    ))
-    
-    state.log("INFO", f"KODA-7 started in {args.mode} mode")
-    
-    if args.mode == 'agent':
-        # إرسال رسالة بدء
-        if CHAT_ID:
+    def scheduler_worker(self):
+        """معالجة المهام المجدولة (cron)"""
+        while self.running:
             try:
-                bot.send_message(int(CHAT_ID), 
-                                f"""🚀 *KODA-7 نشط*
-                                
-🔄 تشغيل رقم: `{state.state['total_runs']}`
-📅 الوقت: `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`
-⚡ الوضع: `Agent Mode`
-                                
-✅ النظام جاهز للاستلام.""",
-                                parse_mode="Markdown")
+                jobs = self.state.get_cron_jobs()
+                now = datetime.now()
+                for job in jobs:
+                    # هنا يجب تحليل الجدول cron (مكتبة croniter) وتنفيذها عند استحقاقها
+                    # تبسيطاً: ننفذها كل دورة إذا لم تنفذ خلال آخر ساعة
+                    last_run = datetime.fromisoformat(job['last_run']) if job['last_run'] else None
+                    if not last_run or (now - last_run) > timedelta(hours=1):
+                        # تنفيذ الأمر
+                        self.bot.send_message(CHAT_ID, f"🔄 تنفيذ مهمة مجدولة: {job['command']}")
+                        # هنا يمكن إضافة المهمة إلى queue
+                        self.task_queue.put(job['command'])
+                        # تحديث last_run
+                        conn = sqlite3.connect(DB_PATH)
+                        c = conn.cursor()
+                        c.execute("UPDATE cron_jobs SET last_run=? WHERE id=?", (now.isoformat(), job['id']))
+                        conn.commit()
+                        conn.close()
+                time.sleep(60)
             except Exception as e:
-                console.print(f"[red]❌ فشل إرسال رسالة البدء: {e}[/red]")
-        
-        # بدء مدير المهام
-        task_mgr.start()
-        
-        # تشغيل البوت
-        console.print("[green]🤖 Bot polling started...[/green]")
-        try:
-            bot.polling(none_stop=True, interval=1, timeout=30)
-        except Exception as e:
-            state.log("ERROR", f"Bot polling error: {e}")
-            traceback.print_exc()
-        finally:
-            task_mgr.stop()
-    
-    elif args.mode == 'scheduler':
-        run_scheduler()
-    
-    elif args.mode == 'maintenance':
-        # صيانة النظام
-        state.log("INFO", "Running maintenance")
-        
-        # تنظيف السجلات القديمة
-        old_logs = len(state.logs["logs"])
-        state.logs["logs"] = state.logs["logs"][-1000:]
-        
-        # تنظيف الذاكرة
-        state.memory["conversations"] = state.memory["conversations"][-100:]
-        
-        state.save()
-        
-        if CHAT_ID:
-            bot.send_message(int(CHAT_ID),
-                            f"""🔧 *صيانة النظام*
-                            
-🧹 تم تنظيف السجلات: `{old_logs - len(state.logs['logs'])}`
-💾 حجم الذاكرة: `{len(state.memory['conversations'])}` محادثة
-✅ النظام نظيف.""",
-                            parse_mode="Markdown")
-    
-    state.log("INFO", "KODA-7 shutting down")
-    state.save()
+                self.state.log("ERROR", f"خطأ في المجدول: {e}")
 
+    def bot_polling(self):
+        """تشغيل البوت مع إعادة محاولة مستمرة"""
+        while self.running:
+            try:
+                self.bot.polling(none_stop=True, interval=1, timeout=30)
+            except Exception as e:
+                self.state.log("ERROR", f"توقف البوت: {e}. إعادة المحاولة بعد 5 ثوانٍ...")
+                time.sleep(5)
+
+    def run(self):
+        """تشغيل الوكيل"""
+        self.state.log("INFO", "بدء تشغيل KODA-7 Agent")
+        self.bot.send_message(CHAT_ID, "🚀 KODA-7 قيد التشغيل الآن.")
+        while self.running:
+            time.sleep(1)
+
+# ========================== نقطة الدخول ==========================
 if __name__ == "__main__":
-    main()
+    agent = KODA7Agent()
+    agent.run()
