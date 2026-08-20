@@ -1,4 +1,4 @@
-name: KODA-7 ULTIMATE
+name: KODA-7 Agent
 
 on:
   schedule:
@@ -20,16 +20,15 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
       - run: pip install -r requirements.txt
-      - name: Run Agent
+      - run: python agent.py
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
           GH_PAT: ${{ secrets.GH_PAT }}
-        run: python agent.py
-      - name: Commit auto changes
-        if: success()
-        run: |
+      - run: |
           git config user.name "KODA-7"
           git config user.email "bot@koda.ai"
           git add -A
