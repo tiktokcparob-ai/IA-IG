@@ -38,7 +38,7 @@ load_dotenv()
 console = Console()
 
 # ─── المتغيرات البيئية ───
-GH_PAT = os.getenv("GH_PAT")
+GH_PAT = os.getenv("g")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
