@@ -1,435 +1,370 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import os
-import sys
-import json
 import sqlite3
+import json
 import time
 import threading
-import logging
-import re
-from datetime import datetime, timedelta
-from queue import Queue
-
-import telebot
-from telebot.types import Message
-from groq import Groq
-from instagrapi import Client
+import asyncio
+from datetime import datetime
+from telebot import TeleBot
 from telethon import TelegramClient
+from telethon.errors import SessionPasswordNeededError
+from instagrapi import Client as InstaClient
+from groq import Groq
+from croniter import croniter
 
-# إعدادات التسجيل
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
-logger = logging.getLogger(__name__)
+# ==========================================
+# 1. إعداد المتغيرات البيئية
+# ==========================================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+TG_API_ID = os.getenv("TG_API_ID")
+TG_API_HASH = os.getenv("TG_API_HASH")
 
-# ==== المتغيرات البيئية ====
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
-CHAT_ID = int(os.environ.get('CHAT_ID', 0))
-GROQ_API_KEY = os.environ.get('GROQ_API_KEY')
-TG_API_ID = int(os.environ.get('TG_API_ID', 0))
-TG_API_HASH = os.environ.get('TG_API_HASH', '')
+if not all([BOT_TOKEN, GROQ_API_KEY, TG_API_ID, TG_API_HASH]):
+    raise ValueError("Missing essential environment variables.")
 
-if not BOT_TOKEN or not GROQ_API_KEY:
-    logger.error('BOT_TOKEN و GROQ_API_KEY مطلوبان')
-    sys.exit(1)
+# ==========================================
+# 2. تهيئة قاعدة البيانات (SQLite)
+# ==========================================
+DB_PATH = "koda7.db"
 
-DB_PATH = 'koda7.db'
-
-# ==== قاعدة البيانات (جلسات، مهام، محادثات) ====
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS sessions (
-        platform TEXT PRIMARY KEY,
-        data TEXT,
-        updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS tasks (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        command TEXT,
-        platform TEXT,
-        status TEXT DEFAULT 'pending',
-        result TEXT,
-        scheduled TIMESTAMP,
-        created TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS conv (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        role TEXT,
-        content TEXT,
-        ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS pending (
-        chat_id INTEGER PRIMARY KEY,
-        platform TEXT,
-        step TEXT,
-        data TEXT
-    )''')
+    # جدول الجلسات
+    c.execute('''CREATE TABLE IF NOT EXISTS sessions
+                 (platform TEXT PRIMARY KEY, session_data TEXT)''')
+    # جدول المهام الفورية
+    c.execute('''CREATE TABLE IF NOT EXISTS tasks
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, platform TEXT, action TEXT, args TEXT, status TEXT)''')
+    # جدول المهام المجدولة (cron)
+    c.execute('''CREATE TABLE IF NOT EXISTS cron_jobs
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, cron_expr TEXT, platform TEXT, action TEXT, args TEXT)''')
+    # جدول حالات الانتظار (لرموز التحقق وكلمات المرور)
+    c.execute('''CREATE TABLE IF NOT EXISTS pending
+                 (user_id TEXT PRIMARY KEY, state TEXT, data TEXT)''')
+    # جدول سجلات النظام (Logs)
+    c.execute('''CREATE TABLE IF NOT EXISTS logs
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, level TEXT, message TEXT)''')
     conn.commit()
     conn.close()
+
+def db_execute(query, params=(), fetch=False, fetchall=False):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute(query, params)
+    result = None
+    if fetch:
+        result = c.fetchone()
+    elif fetchall:
+        result = c.fetchall()
+    else:
+        conn.commit()
+    conn.close()
+    return result
+
+def log_event(level, message):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    db_execute("INSERT INTO logs (timestamp, level, message) VALUES (?, ?, ?)", (timestamp, level, message))
+    print(f"[{level}] {message}")
 
 init_db()
 
-# ==== دوال مساعدة للقاعدة ====
-def get_session(platform):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT data FROM sessions WHERE platform=?', (platform,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else None
-
-def save_session(platform, data):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('INSERT OR REPLACE INTO sessions (platform, data) VALUES (?,?)', (platform, data))
-    conn.commit()
-    conn.close()
-
-def add_task(command, platform, scheduled=None):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('INSERT INTO tasks (command, platform, scheduled) VALUES (?,?,?)',
-              (command, platform, scheduled))
-    task_id = c.lastrowid
-    conn.commit()
-    conn.close()
-    return task_id
-
-def get_pending_tasks():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT id, command, platform FROM tasks WHERE status="pending" AND (scheduled IS NULL OR scheduled <= datetime("now"))')
-    rows = c.fetchall()
-    conn.close()
-    return [{'id': r[0], 'command': r[1], 'platform': r[2]} for r in rows]
-
-def update_task(task_id, status, result=''):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('UPDATE tasks SET status=?, result=? WHERE id=?', (status, result, task_id))
-    conn.commit()
-    conn.close()
-
-def add_conv(user_id, role, content):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('INSERT INTO conv (user_id, role, content) VALUES (?,?,?)', (user_id, role, content))
-    conn.commit()
-    conn.close()
-    # احتفظ بآخر 50 فقط
-    c.execute('DELETE FROM conv WHERE id NOT IN (SELECT id FROM conv WHERE user_id=? ORDER BY ts DESC LIMIT 50)', (user_id,))
-    conn.commit()
-    conn.close()
-
-def get_conv(user_id, limit=20):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT role, content FROM conv WHERE user_id=? ORDER BY ts DESC LIMIT ?', (user_id, limit))
-    rows = c.fetchall()
-    conn.close()
-    return [{'role': r[0], 'content': r[1]} for r in reversed(rows)]
-
-def set_pending(chat_id, platform, step, data=''):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('INSERT OR REPLACE INTO pending (chat_id, platform, step, data) VALUES (?,?,?,?)',
-              (chat_id, platform, step, data))
-    conn.commit()
-    conn.close()
-
-def get_pending(chat_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT platform, step, data FROM pending WHERE chat_id=?', (chat_id,))
-    row = c.fetchone()
-    conn.close()
-    return {'platform': row[0], 'step': row[1], 'data': row[2]} if row else None
-
-def clear_pending(chat_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('DELETE FROM pending WHERE chat_id=?', (chat_id,))
-    conn.commit()
-    conn.close()
-
-# ==== محرك Groq (ذكاء اصطناعي) ====
-class GroqEngine:
+# ==========================================
+# 3. محرك الذكاء الاصطناعي (Groq)
+# ==========================================
+class AIEngine:
     def __init__(self):
         self.client = Groq(api_key=GROQ_API_KEY)
-        self.model = 'llama3-70b-8192'  # مدعوم
+        self.model = "llama3-70b-8192"
 
     def understand(self, text):
-        """يحلل الأمر الطبيعي ويعيد JSON"""
-        system = 'استخرج من النص: المنصة (instagram, telegram), الفعل (login, post, story, send_message, interact), المحتوى. أخرج JSON فقط.'
+        prompt = f"""
+        أنت وكيل تحليل أوامر. قم بتحليل الأمر التالي واستخرج المعلومات بصيغة JSON فقط بدون أي نص إضافي.
+        المنصات المدعومة: instagram, telegram, system
+        الأفعال المدعومة لـ instagram: login, post_photo, post_video, interact_stories
+        الأفعال المدعومة لـ telegram: login, send_message
+        الأفعال المدعومة لـ system: add_cron, status
+        
+        الأمر: "{text}"
+        
+        الصيغة المطلوبة (مثال):
+        {{"platform": "instagram", "action": "login", "args": {{"username": "x", "password": "y"}}}}
+        {{"platform": "system", "action": "add_cron", "args": {{"cron": "0 9 * * *", "task_text": "انشر صورة"}}}}
+        """
         try:
-            resp = self.client.chat.completions.create(
+            response = self.client.chat.completions.create(
                 model=self.model,
-                messages=[{'role': 'system', 'content': system}, {'role': 'user', 'content': text}],
-                temperature=0.3,
-                max_tokens=300
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                response_format={"type": "json_object"}
             )
-            return json.loads(resp.choices[0].message.content)
-        except:
-            return {'platform': 'unknown', 'action': 'unknown', 'content': text}
+            return json.loads(response.choices[0].message.content)
+        except Exception as e:
+            log_event("ERROR", f"Groq Understanding Error: {str(e)}")
+            return None
 
-    def chat(self, messages, system='أنت مساعد ذكي'):
+    def generate_reply(self, text):
         try:
-            resp = self.client.chat.completions.create(
+            response = self.client.chat.completions.create(
                 model=self.model,
-                messages=[{'role': 'system', 'content': system}] + messages,
-                temperature=0.7,
-                max_tokens=1024
+                messages=[
+                    {"role": "system", "content": "أنت KODA-7، وكيل ذكاء اصطناعي تتحدث العربية الفصحى وتنفذ أوامر الأتمتة."},
+                    {"role": "user", "content": text}
+                ],
+                temperature=0.7
             )
-            return resp.choices[0].message.content
-        except:
-            return 'عذراً، حدث خطأ في الذكاء الاصطناعي.'
+            return response.choices[0].message.content
+        except Exception as e:
+            return "حدث خطأ أثناء معالجة الرد."
 
-# ==== منصة إنستغرام ====
+# ==========================================
+# 4. مدير منصة Instagram
+# ==========================================
 class InstagramBot:
     def __init__(self):
-        self.client = None
-        self.session = get_session('instagram')
-        if self.session:
+        self.cl = InstaClient()
+        self.load_session()
+
+    def load_session(self):
+        session_row = db_execute("SELECT session_data FROM sessions WHERE platform='instagram'", fetch=True)
+        if session_row:
             try:
-                self.client = Client()
-                self.client.load_settings(self.session)
-                self.client.get_timeline_feed()
-                logger.info('استعادة جلسة إنستغرام')
-            except:
-                self.client = None
+                self.cl.set_settings(json.loads(session_row['session_data']))
+                log_event("INFO", "Instagram session loaded.")
+            except Exception as e:
+                log_event("ERROR", f"Failed to load IG session: {str(e)}")
+
+    def save_session(self):
+        session_data = json.dumps(self.cl.get_settings())
+        db_execute("INSERT OR REPLACE INTO sessions (platform, session_data) VALUES ('instagram', ?)", (session_data,))
 
     def login(self, username, password):
         try:
-            if self.client:
-                return True
-            cl = Client()
-            cl.login(username, password)
-            self.client = cl
-            save_session('instagram', cl.get_settings())
-            logger.info(f'تسجيل دخول إنستغرام كـ {username}')
-            return True
+            self.cl.login(username, password)
+            self.save_session()
+            return True, "تم تسجيل الدخول بنجاح إلى إنستغرام وحفظ الجلسة."
         except Exception as e:
-            logger.error(f'فشل تسجيل الدخول: {e}')
-            return False
-
-    def interact_stories(self):
-        if not self.client:
-            return {'success': False, 'error': 'غير مسجل الدخول'}
-        try:
-            stories = self.client.get_user_stories(self.client.user_id)
-            count = 0
-            for s in stories:
-                self.client.story_seen(s.id)
-                self.client.story_like(s.id)
-                count += 1
-                time.sleep(1)
-            return {'success': True, 'count': count}
-        except Exception as e:
-            return {'success': False, 'error': str(e)}
+            return False, f"فشل تسجيل الدخول: {str(e)}"
 
     def post_photo(self, path, caption):
-        if not self.client:
-            return {'success': False, 'error': 'غير مسجل الدخول'}
         try:
-            res = self.client.photo_upload(path, caption=caption)
-            return {'success': True, 'id': res.id}
+            media = self.cl.photo_upload(path, caption)
+            return True, f"تم نشر الصورة بنجاح. المعرف: {media.pk}"
         except Exception as e:
-            return {'success': False, 'error': str(e)}
+            return False, f"فشل نشر الصورة: {str(e)}"
 
-    def post_video(self, path, caption):
-        if not self.client:
-            return {'success': False, 'error': 'غير مسجل الدخول'}
+    def interact_stories(self, count=5):
         try:
-            res = self.client.video_upload(path, caption=caption)
-            return {'success': True, 'id': res.id}
+            user_id = self.cl.user_id
+            feed = self.cl.user_following(user_id, amount=count)
+            interacted = 0
+            for user in feed.values():
+                stories = self.cl.user_stories(user.pk)
+                if stories:
+                    self.cl.story_like(stories[0].pk)
+                    interacted += 1
+            return True, f"تم التفاعل مع {interacted} ستوري."
         except Exception as e:
-            return {'success': False, 'error': str(e)}
+            return False, f"فشل التفاعل مع الستوريات: {str(e)}"
 
-# ==== منصة تليجرام (باستخدام Telethon) ====
-class TelegramBot:
+# ==========================================
+# 5. مدير منصة Telegram (Telethon)
+# ==========================================
+class TelegramClientBot:
     def __init__(self):
-        self.client = None
-        self.session = get_session('telegram')
-        if self.session:
-            try:
-                self.client = TelegramClient(StringSession(self.session), TG_API_ID, TG_API_HASH)
-                self.client.start()
-                logger.info('استعادة جلسة تليجرام')
-            except:
-                self.client = None
+        self.loop = asyncio.new_event_loop()
+        self.client = TelegramClient('koda_tg_session', int(TG_API_ID), TG_API_HASH, loop=self.loop)
+        
+    def _run_async(self, coro):
+        asyncio.set_event_loop(self.loop)
+        return self.loop.run_until_complete(coro)
 
-    def login(self, phone, password=None, code=None):
-        if not TG_API_ID or not TG_API_HASH:
-            return False
+    def send_code(self, phone):
+        async def _send():
+            await self.client.connect()
+            result = await self.client.send_code_request(phone)
+            return result.phone_code_hash
         try:
-            self.client = TelegramClient(f'session_{phone}', TG_API_ID, TG_API_HASH)
-            if code:
-                self.client.start(phone=phone, password=password, code=code)
-            else:
-                self.client.start(phone=phone, password=password)
-            save_session('telegram', self.client.session.save())
-            return True
+            hash_code = self._run_async(_send())
+            return True, hash_code
         except Exception as e:
-            logger.error(f'فشل تسجيل الدخول: {e}')
-            return False
+            return False, str(e)
 
-    def send_message(self, username, text):
-        if not self.client:
-            return {'success': False, 'error': 'غير مسجل الدخول'}
+    def sign_in(self, phone, code, phone_hash):
+        async def _sign():
+            await self.client.connect()
+            await self.client.sign_in(phone=phone, code=code, phone_code_hash=phone_hash)
         try:
-            entity = self.client.get_entity(username)
-            self.client.send_message(entity, text)
-            return {'success': True}
+            self._run_async(_sign())
+            return True, "تم تسجيل الدخول إلى تيليجرام بنجاح."
+        except SessionPasswordNeededError:
+            return False, "2FA_REQUIRED"
         except Exception as e:
-            return {'success': False, 'error': str(e)}
+            return False, str(e)
 
-# ==== الوكيل الرئيسي ====
+    def sign_in_2fa(self, password):
+        async def _sign_2fa():
+            await self.client.connect()
+            await self.client.sign_in(password=password)
+        try:
+            self._run_async(_sign_2fa())
+            return True, "تم تجاوز 2FA وتسجيل الدخول."
+        except Exception as e:
+            return False, str(e)
+
+    def send_message(self, target, text):
+        async def _send_msg():
+            await self.client.connect()
+            await self.client.send_message(target, text)
+        try:
+            self._run_async(_send_msg())
+            return True, "تم إرسال الرسالة عبر تيليجرام."
+        except Exception as e:
+            return False, f"فشل الإرسال: {str(e)}"
+
+# ==========================================
+# 6. الوكيل الرئيسي KODA-7
+# ==========================================
 class KODA7Agent:
     def __init__(self):
-        self.bot = telebot.TeleBot(BOT_TOKEN)
-        self.ai = GroqEngine()
+        self.bot = TeleBot(BOT_TOKEN)
+        self.ai = AIEngine()
         self.ig = InstagramBot()
-        self.tg = TelegramBot()
-        self.task_queue = Queue()
-        self.running = True
-        self.register_handlers()
-        self.start_threads()
+        self.tg_client = TelegramClientBot()
+        self.setup_handlers()
 
-    def register_handlers(self):
-        @self.bot.message_handler(commands=['start'])
-        def start(msg):
-            self.bot.reply_to(msg, 'مرحباً! أنا وكيلك. أرسل أوامر طبيعية مثل:\n'
-                                   '- سجل الدخول إلى إنستغرام\n'
-                                   '- تفاعل مع ستوريات\n'
-                                   '- أرسل رسالة إلى @username\n'
-                                   '- انشر صورة مع تعليق')
+    def setup_handlers(self):
+        @self.bot.message_handler(func=lambda message: True)
+        def handle_message(message):
+            user_id = str(message.chat.id)
+            text = message.text
 
-        @self.bot.message_handler(commands=['login'])
-        def login(msg):
-            parts = msg.text.split(maxsplit=3)
-            if len(parts) < 4:
-                self.bot.reply_to(msg, 'الصيغة: /login <instagram|telegram> <username/phone> <password>')
-                return
-            plat = parts[1].lower()
-            if plat == 'instagram':
-                if self.ig.login(parts[2], parts[3]):
-                    self.bot.reply_to(msg, '✅ تم تسجيل الدخول إلى إنستغرام')
-                else:
-                    self.bot.reply_to(msg, '❌ فشل تسجيل الدخول')
-            elif plat == 'telegram':
-                # سنطلب رمز التحقق لاحقاً
-                set_pending(msg.chat.id, 'telegram', 'await_code', parts[2])
-                self.bot.reply_to(msg, f'📱 أرسل رمز التحقق الذي وصلك على {parts[2]}')
-            else:
-                self.bot.reply_to(msg, 'منصة غير مدعومة')
-
-        @self.bot.message_handler(func=lambda m: True)
-        def handle_all(msg):
-            chat_id = msg.chat.id
-            text = msg.text
-
-            # التحقق من وجود عملية تسجيل دخول معلقة
-            pending = get_pending(chat_id)
-            if pending and pending['platform'] == 'telegram' and pending['step'] == 'await_code':
-                code = text.strip()
-                # محاولة إكمال تسجيل الدخول
-                phone = pending['data']
-                if self.tg.login(phone, code=code):
-                    self.bot.reply_to(msg, '✅ تم تسجيل الدخول إلى تليجرام')
-                    clear_pending(chat_id)
-                else:
-                    self.bot.reply_to(msg, '❌ رمز غير صحيح، حاول مجدداً')
+            # 1. التحقق من وجود حالة انتظار (Pending State)
+            pending = db_execute("SELECT * FROM pending WHERE user_id=?", (user_id,), fetch=True)
+            if pending:
+                self.process_pending_state(user_id, text, pending)
                 return
 
-            # استخدام الذكاء الاصطناعي لفهم الأمر
-            analysis = self.ai.understand(text)
-            plat = analysis.get('platform', 'unknown')
-            action = analysis.get('action', 'unknown')
-            content = analysis.get('content', '')
+            # 2. تحليل الأمر الطبيعي
+            self.bot.reply_to(message, "⏳ جاري التحليل...")
+            parsed = self.ai.understand(text)
+            
+            if not parsed:
+                reply = self.ai.generate_reply(text)
+                self.bot.reply_to(message, reply)
+                return
 
-            if plat == 'instagram':
-                if action == 'login':
-                    self.bot.reply_to(msg, 'استخدم /login instagram <user> <pass>')
-                elif action == 'story' or action == 'interact':
-                    res = self.ig.interact_stories()
-                    if res['success']:
-                        self.bot.reply_to(msg, f'✅ تم التفاعل مع {res["count"]} ستوري')
-                    else:
-                        self.bot.reply_to(msg, f'❌ {res["error"]}')
-                elif action == 'post' or 'انشر' in text:
-                    self.bot.reply_to(msg, 'أرسل النص ثم رابط/مسار الملف (صورة أو فيديو)')
-                    # يمكن تحسين هذا لاحقاً
-                else:
-                    self.bot.reply_to(msg, '⚠️ الأمر غير معروف للإنستغرام')
-            elif plat == 'telegram':
-                if action == 'login':
-                    self.bot.reply_to(msg, 'استخدم /login telegram <phone> <password>')
-                elif action == 'send_message':
-                    match = re.search(r'@(\w+)', text)
-                    if match:
-                        username = match.group(1)
-                        parts = text.split(f'@{username}', 1)
-                        msg_text = parts[1].strip() if len(parts) > 1 else ''
-                        if not msg_text:
-                            self.bot.reply_to(msg, 'أدخل النص المرسل')
-                            return
-                        res = self.tg.send_message(username, msg_text)
-                        if res['success']:
-                            self.bot.reply_to(msg, f'✅ أرسلت إلى @{username}')
-                        else:
-                            self.bot.reply_to(msg, f'❌ {res["error"]}')
-                    else:
-                        self.bot.reply_to(msg, 'استخدم: أرسل رسالة إلى @username النص')
-                else:
-                    self.bot.reply_to(msg, '⚠️ الأمر غير معروف لتليجرام')
+            platform = parsed.get("platform")
+            action = parsed.get("action")
+            args = parsed.get("args", {})
+
+            # 3. توجيه الأمر فوراً
+            self.execute_command(user_id, platform, action, args, message)
+
+    def process_pending_state(self, user_id, text, pending_row):
+        state = pending_row['state']
+        data = json.loads(pending_row['data'])
+
+        if state == "TG_WAIT_CODE":
+            phone = data['phone']
+            phone_hash = data['phone_hash']
+            success, result = self.tg_client.sign_in(phone, text, phone_hash)
+            
+            if success:
+                db_execute("DELETE FROM pending WHERE user_id=?", (user_id,))
+                self.bot.send_message(user_id, "✅ " + result)
+            elif result == "2FA_REQUIRED":
+                db_execute("UPDATE pending SET state=?, data=? WHERE user_id=?", 
+                           ("TG_WAIT_PASSWORD", json.dumps({"phone": phone}), user_id))
+                self.bot.send_message(user_id, "🔒 الحساب محمي بخطوتين. أرسل كلمة المرور:")
             else:
-                # رد عام من الذكاء الاصطناعي
-                add_conv(chat_id, 'user', text)
-                history = get_conv(chat_id)
-                msgs = [{'role': h['role'], 'content': h['content']} for h in history]
-                response = self.ai.chat(msgs, 'أنت مساعد ذكي للأتمتة، أجب بالعربية')
-                add_conv(chat_id, 'assistant', response)
-                self.bot.reply_to(msg, response)
+                db_execute("DELETE FROM pending WHERE user_id=?", (user_id,))
+                self.bot.send_message(user_id, f"❌ فشل تسجيل الدخول: {result}")
 
-    def start_threads(self):
-        threading.Thread(target=self.task_worker, daemon=True).start()
-        threading.Thread(target=self.scheduler_worker, daemon=True).start()
-        threading.Thread(target=self.bot_polling, daemon=True).start()
+        elif state == "TG_WAIT_PASSWORD":
+            success, result = self.tg_client.sign_in_2fa(text)
+            db_execute("DELETE FROM pending WHERE user_id=?", (user_id,))
+            if success:
+                self.bot.send_message(user_id, "✅ " + result)
+            else:
+                self.bot.send_message(user_id, f"❌ فشل تسجيل الدخول: {result}")
 
-    def task_worker(self):
-        while self.running:
-            try:
-                tasks = get_pending_tasks()
-                for t in tasks:
-                    # تنفيذ المهمة (يمكن تحسينه)
-                    logger.info(f'تنفيذ مهمة #{t["id"]}: {t["command"]}')
-                    update_task(t['id'], 'completed', 'تم التنفيذ')
-                time.sleep(30)
-            except Exception as e:
-                logger.error(f'خطأ في معالج المهام: {e}')
-                time.sleep(60)
+    def execute_command(self, user_id, platform, action, args, original_message=None):
+        response_msg = ""
+        
+        if platform == "system":
+            if action == "add_cron":
+                cron_expr = args.get("cron")
+                task_text = args.get("task_text")
+                # استخدام الذكاء لتحليل الأمر الداخلي
+                inner_parsed = self.ai.understand(task_text)
+                if inner_parsed:
+                    db_execute("INSERT INTO cron_jobs (cron_expr, platform, action, args) VALUES (?, ?, ?, ?)",
+                               (cron_expr, inner_parsed.get("platform"), inner_parsed.get("action"), json.dumps(inner_parsed.get("args", {}))))
+                    response_msg = f"📌 تم إضافة المهمة المجدولة بنجاح: {cron_expr}"
+                else:
+                    response_msg = "❌ لم أتمكن من فهم المهمة المجدولة."
+                    
+        elif platform == "instagram":
+            if action == "login":
+                success, msg = self.ig.login(args.get("username"), args.get("password"))
+                response_msg = ("✅ " if success else "❌ ") + msg
+            elif action == "post_photo":
+                success, msg = self.ig.post_photo(args.get("path"), args.get("caption", ""))
+                response_msg = ("✅ " if success else "❌ ") + msg
+            elif action == "interact_stories":
+                success, msg = self.ig.interact_stories(args.get("count", 5))
+                response_msg = ("✅ " if success else "❌ ") + msg
+                
+        elif platform == "telegram":
+            if action == "login":
+                phone = args.get("phone")
+                success, result = self.tg_client.send_code(phone)
+                if success:
+                    db_execute("INSERT OR REPLACE INTO pending (user_id, state, data) VALUES (?, ?, ?)",
+                               (user_id, "TG_WAIT_CODE", json.dumps({"phone": phone, "phone_hash": result})))
+                    response_msg = "📲 تم إرسال رمز التحقق إلى تيليجرام. يرجى إرساله هنا الآن:"
+                else:
+                    response_msg = f"❌ فشل إرسال الرمز: {result}"
+            elif action == "send_message":
+                success, msg = self.tg_client.send_message(args.get("target"), args.get("text"))
+                response_msg = ("✅ " if success else "❌ ") + msg
 
-    def scheduler_worker(self):
-        # يمكن إضافة جدولة cron هنا (حسب الطلب)
-        while self.running:
+        if original_message:
+            self.bot.reply_to(original_message, response_msg)
+        elif CHAT_ID:
+            self.bot.send_message(CHAT_ID, response_msg)
+
+    # ==========================================
+    # 7. نظام المهام المجدولة (Cron Worker)
+    # ==========================================
+    def cron_worker(self):
+        log_event("INFO", "Cron worker started.")
+        while True:
+            now = datetime.now()
+            jobs = db_execute("SELECT * FROM cron_jobs", fetchall=True)
+            for job in jobs:
+                cron = croniter(job['cron_expr'], now)
+                # إذا كانت المهمة مستحقة في هذه الدقيقة
+                if abs(cron.get_prev(datetime).timestamp() - now.timestamp()) < 60:
+                    log_event("INFO", f"Executing Cron Job {job['id']}")
+                    self.execute_command(CHAT_ID, job['platform'], job['action'], json.loads(job['args']))
             time.sleep(60)
 
-    def bot_polling(self):
-        while self.running:
-            try:
-                self.bot.polling(none_stop=True, interval=1, timeout=30)
-            except Exception as e:
-                logger.error(f'توقف البوت: {e}. إعادة المحاولة...')
-                time.sleep(5)
+    def start(self):
+        log_event("INFO", "KODA-7 Agent starting...")
+        if CHAT_ID:
+            self.bot.send_message(CHAT_ID, "🚀 KODA-7 بدأ العمل الآن. ينتظر أوامرك.")
+        
+        # تشغيل الـ Cron في Thread منفصل
+        threading.Thread(target=self.cron_worker, daemon=True).start()
+        
+        # تشغيل البوت
+        self.bot.infinity_polling()
 
-    def run(self):
-        logger.info('🚀 KODA-7 يعمل')
-        self.bot.send_message(CHAT_ID, '🌟 الوكيل جاهز')
-        while self.running:
-            time.sleep(1)
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     agent = KODA7Agent()
-    agent.run()
+    agent.start()
