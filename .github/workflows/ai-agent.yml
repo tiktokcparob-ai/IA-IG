@@ -1,38 +1,49 @@
-name: KODA-7 Agent
+name: KODA-7 AI Agent Continuous
 
 on:
   schedule:
+    # تشغيل تلقائي كل 6 ساعات
     - cron: '0 */6 * * *'
-  workflow_dispatch:
+  workflow_dispatch: # زر التشغيل اليدوي
 
 jobs:
-  run:
+  run-agent:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: write
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Repository
+        uses: actions/checkout@v4
         with:
           token: ${{ secrets.GH_PAT }}
-      - uses: actions/setup-python@v5
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.10'
           cache: 'pip'
-      - run: pip install -r requirements.txt
-      - run: python agent.py
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run KODA-7 Agent
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
-          GH_PAT: ${{ secrets.GH_PAT }}
-      - run: |
-          git config user.name "KODA-7"
-          git config user.email "bot@koda.ai"
-          git add -A
-          git diff --staged --quiet || git commit -m "Auto update [skip ci]"
+        # استخدام timeout لإيقاف البوت بعد 5 ساعات و 30 دقيقة (330 دقيقة)
+        # هذا يمنع GitHub من قتله فجأة ويسمح للخطوة التالية بحفظ قاعدة البيانات
+        run: |
+          timeout 330m python agent.py || true
+
+      - name: Save Sessions and Database back to Repo
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add koda7.db *.session || true
+          # [skip ci] تمنع الدخول في حلقة لا نهائية من التشغيل عند رفع الملفات
+          git commit -m "Auto-save: Update database and sessions [skip ci]" || echo "No changes to commit"
           git push
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
